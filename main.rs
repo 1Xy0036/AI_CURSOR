@@ -53,6 +53,10 @@ struct Args {
     /// NUMA节点绑定 (0: 自动, 1: 单节点, 2: 双节点交错)
     #[arg(long, default_value_t = 2)]
     numa_mode: u8,
+
+    /// 将JSON结果保存到指定文件而不是打印到标准输出
+    #[arg(long, short)]
+    output: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -178,6 +182,11 @@ fn mine_cpu_epyc7k62(
     // 使用NUMA感知的批处理大小，转换为usize范围
     let chunk_size = std::cmp::min(NUMA_BATCH_SIZE, total_nonces as usize);
     
+    // 边界情况处理：如果总数为0或块大小为0，则无需搜索
+    if total_nonces == 0 || chunk_size == 0 {
+        return None;
+    }
+    
     (0..total_nonces as usize)
         .into_par_iter()
         .chunks(chunk_size)
@@ -225,46 +234,52 @@ fn mine_cpu_stream_epyc7k62(
     total_nonces: u64,
     baseline_bits: u32,
 ) -> Option<PowResult> {
+    use std::cell::RefCell;
+
+    // 线程本地存储，避免在每个chunk中重复创建对象
+    thread_local! {
+        static HASHER: RefCell<Zen2OptimizedHasher> = RefCell::new(Zen2OptimizedHasher::new());
+        static PREFIX: RefCell<NumaAwareChallengePrefix> = RefCell::new(NumaAwareChallengePrefix::new(""));
+    }
+
     // 原子地追踪当前找到的最佳结果，以减少通信开销
     let current_best_bits = Arc::new(AtomicU32::new(baseline_bits));
     
-    // 使用Vec收集结果，避免复杂的channel处理
-    let results: Vec<PowResult> = (0..total_nonces as usize)
+    // 使用 reduce 代替 collect，直接在并行计算中找到最优解，减少内存分配
+    (0..total_nonces as usize)
         .into_par_iter()
         .chunks(NUMA_BATCH_SIZE)
-        .flat_map(|chunk_indices| {
-            let mut prefix = NumaAwareChallengePrefix::new(challenge);
-            let mut hasher = Zen2OptimizedHasher::new();
-            let mut local_results = Vec::new();
-            
-            for idx in chunk_indices {
-                let nonce = start_nonce + idx as u64;
-                
-                // 早期退出：如果其他线程已经找到了足够好的结果，就没必要继续计算
-                let current_best = current_best_bits.load(Ordering::Relaxed);
+        .filter_map(|chunk_indices| { // 每个线程会处理多个chunk
+            PREFIX.with(|p| {
+                let mut prefix = p.borrow_mut();
+                *prefix = NumaAwareChallengePrefix::new(challenge); // 每个批次开始时更新challenge
 
-                let message = prefix.create_message(nonce);
-                let hash_array = hasher.double_sha256(message);
-                let leading_zeros = count_leading_zero_bits_zen2(&hash_array);
-                
-                // 只有当发现更优解时才记录
-                if leading_zeros > current_best {
-                    // 尝试更新全局最优值
-                    current_best_bits.fetch_max(leading_zeros, Ordering::Relaxed);
-                    // 添加这个更优的结果
-                    local_results.push(PowResult {
-                        nonce,
-                        hash_hex: hex::encode(hash_array),
-                        leading_zero_bits: leading_zeros,
-                    });
-                }
-            }
-            local_results
+                HASHER.with(|h| {
+                    let mut hasher = h.borrow_mut();
+                    let mut local_best: Option<PowResult> = None;
+
+                    for idx in chunk_indices {
+                        let nonce = start_nonce + idx as u64;
+                        let current_best = current_best_bits.load(Ordering::Relaxed);
+
+                        let message = prefix.create_message(nonce);
+                        let hash_array = hasher.double_sha256(message);
+                        let leading_zeros = count_leading_zero_bits_zen2(&hash_array);
+                        
+                        if leading_zeros > current_best && (local_best.is_none() || leading_zeros > local_best.as_ref().unwrap().leading_zero_bits) {
+                            current_best_bits.fetch_max(leading_zeros, Ordering::Relaxed);
+                            local_best = Some(PowResult {
+                                nonce,
+                                hash_hex: hex::encode(hash_array),
+                                leading_zero_bits: leading_zeros,
+                            });
+                        }
+                    }
+                    local_best
+                })
+            })
         })
-        .collect();
-
-    // 从所有结果中找到最好的
-    results.into_iter().max_by_key(|r| r.leading_zero_bits)
+        .reduce_with(|a, b| if a.leading_zero_bits >= b.leading_zero_bits { a } else { b })
 }
 
 fn setup_epyc7k62_environment(args: &Args) {
@@ -290,6 +305,31 @@ fn setup_epyc7k62_environment(args: &Args) {
     eprintln!("EPYC 7K62优化配置: {} 工作线程, NUMA模式: {}", thread_count, args.numa_mode);
 }
 
+/// 将结果写入文件或标准输出
+fn write_output(output_json: &serde_json::Value, output_path: &Option<String>, append: bool) {
+    // to_string_pretty is slightly nicer for file logs, but to_string is fine for performance.
+    let output_string = match serde_json::to_string_pretty(output_json) {
+        Ok(s) => s,
+        Err(_) => serde_json::to_string(output_json).unwrap(), // Fallback
+    };
+
+    if let Some(path) = output_path {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .open(path)
+            .unwrap_or_else(|e| panic!("无法打开输出文件 '{}': {}", path, e));
+        
+        writeln!(file, "{}", output_string).unwrap_or_else(|e| panic!("无法写入文件 '{}': {}", path, e));
+    } else {
+        println!("{}", output_string);
+    }
+}
+
 fn main() {
     let args = Args::parse();
     
@@ -312,13 +352,14 @@ fn main() {
         let mut baseline = args.baseline;
         let mut current_nonce = args.start;
         let batch_size = args.batch;
+        let challenge_str = challenge.as_str();
         
         eprintln!("EPYC 7K62流模式启动...");
-        println!("进入持续模式... Challenge: '{}', 初始基线: {}", challenge, baseline);
+        println!("进入持续模式... Challenge: '{}', 初始基线: {}", challenge_str, baseline);
 
         loop {
             let start_time = Instant::now();
-            if let Some(res) = mine_cpu_stream_epyc7k62(&challenge, current_nonce, batch_size, baseline) {
+            if let Some(res) = mine_cpu_stream_epyc7k62(challenge_str, current_nonce, batch_size, baseline) {
                 if res.leading_zero_bits > baseline {
                     baseline = res.leading_zero_bits;
                     let output = serde_json::json!({
@@ -328,23 +369,23 @@ fn main() {
                         "baseline": baseline,
                         "cpu_model": "AMD_EPYC_7K62_Dual"
                     });
-                    println!("{}", serde_json::to_string(&output).unwrap());
+                    write_output(&output, &args.output, true);
                 }
             }
             
             let duration = start_time.elapsed();
             let hashes_per_sec = (batch_size as f64 / duration.as_secs_f64()) / 1_000_000.0;
             
+            let next_nonce = current_nonce + batch_size;
             eprintln!(
                 "[EPYC7K62] 批次 [{}..{}] 完成. 耗时: {:.2?}, 算力: {:.1} MH/s, 基线: {}",
                 current_nonce,
-                current_nonce + batch_size - 1,
+                next_nonce - 1,
                 duration,
                 hashes_per_sec,
                 baseline
             );
-            
-            current_nonce += batch_size;
+            current_nonce = next_nonce;
         }
     } else {
         // --- 阈值模式 (EPYC 7K62优化) ---
@@ -386,7 +427,7 @@ fn main() {
             "cpu_model": "AMD_EPYC_7K62_Dual",
             "hashrate_mhs": hashes_per_sec
         });
-        println!("{}", serde_json::to_string(&output).unwrap());
+        write_output(&output, &args.output, false);
     }
 }
 

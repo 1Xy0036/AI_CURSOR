@@ -1,0 +1,33 @@
+{
+  "baseline": 26,
+  "best": {
+    "hash_hex": "00000029ce2fb07088884ce19f06f3dd7f0d8befb058f44dce930748802211ce",
+    "leading_zero_bits": 26,
+    "nonce": 44037868
+  },
+  "challenge": "8d15e878f2d656b96a67fc0538c46c8d7fe571186b14558b340010346703b4f8:2",
+  "cpu_model": "AMD_EPYC_7K62_Dual",
+  "mode": "stream_epyc7k62"
+}
+{
+  "baseline": 29,
+  "best": {
+    "hash_hex": "000000055cb6c8e40f4224af50ecacc137abba1768dbffdb7dfa300f06f8fc36",
+    "leading_zero_bits": 29,
+    "nonce": 145230499
+  },
+  "challenge": "8d15e878f2d656b96a67fc0538c46c8d7fe571186b14558b340010346703b4f8:2",
+  "cpu_model": "AMD_EPYC_7K62_Dual",
+  "mode": "stream_epyc7k62"
+}
+{
+  "baseline": 32,
+  "best": {
+    "hash_hex": "00000000c32411aa912f75c5109ff87554dea747340a113464cf74a019e3d5d6",
+    "leading_zero_bits": 32,
+    "nonce": 704321224
+  },
+  "challenge": "8d15e878f2d656b96a67fc0538c46c8d7fe571186b14558b340010346703b4f8:2",
+  "cpu_model": "AMD_EPYC_7K62_Dual",
+  "mode": "stream_epyc7k62"
+}
