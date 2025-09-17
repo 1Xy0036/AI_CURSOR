@@ -330,104 +330,112 @@ fn write_output(output_json: &serde_json::Value, output_path: &Option<String>, a
     }
 }
 
-fn main() {
-    let args = Args::parse();
-    
+/// 运行程序的主逻辑，返回Result以便于错误处理
+fn run(args: Args) -> Result<(), String> {
     // 设置针对EPYC 7K62优化的环境
     setup_epyc7k62_environment(&args);
 
     if args.threshold.is_some() && args.stream {
-        eprintln!("错误: --threshold 和 --stream 参数是互斥的。");
-        return;
+        return Err("错误: --threshold 和 --stream 参数是互斥的。".to_string());
     }
 
     let challenge = format!("{}:{}", args.txid, args.vout);
     if challenge.len() > MAX_CHALLENGE_LEN {
-        eprintln!("错误: txid 过长，导致 challenge 长度超过 {} 字节。", MAX_CHALLENGE_LEN);
-        return;
+        return Err(format!("错误: txid 过长，导致 challenge 长度超过 {} 字节。", MAX_CHALLENGE_LEN));
     }
 
     if args.stream {
         // --- 持续模式 (EPYC 7K62优化) ---
-        let mut baseline = args.baseline;
-        let mut current_nonce = args.start;
-        let batch_size = args.batch;
-        let challenge_str = challenge.as_str();
-        
-        eprintln!("EPYC 7K62流模式启动...");
-        println!("进入持续模式... Challenge: '{}', 初始基线: {}", challenge_str, baseline);
-
-        loop {
-            let start_time = Instant::now();
-            if let Some(res) = mine_cpu_stream_epyc7k62(challenge_str, current_nonce, batch_size, baseline) {
-                if res.leading_zero_bits > baseline {
-                    baseline = res.leading_zero_bits;
-                    let output = serde_json::json!({
-                        "mode": "stream_epyc7k62",
-                        "challenge": challenge,
-                        "best": res,
-                        "baseline": baseline,
-                        "cpu_model": "AMD_EPYC_7K62_Dual"
-                    });
-                    write_output(&output, &args.output, true);
-                }
-            }
-            
-            let duration = start_time.elapsed();
-            let hashes_per_sec = (batch_size as f64 / duration.as_secs_f64()) / 1_000_000.0;
-            
-            let next_nonce = current_nonce + batch_size;
-            eprintln!(
-                "[EPYC7K62] 批次 [{}..{}] 完成. 耗时: {:.2?}, 算力: {:.1} MH/s, 基线: {}",
-                current_nonce,
-                next_nonce - 1,
-                duration,
-                hashes_per_sec,
-                baseline
-            );
-            current_nonce = next_nonce;
-        }
+        run_stream_mode(args, &challenge)?;
     } else {
         // --- 阈值模式 (EPYC 7K62优化) ---
-        let threshold = match args.threshold {
-            Some(t) => t,
-            None => {
-                eprintln!("错误: 阈值模式下必须提供 --threshold 参数，或使用 --stream 模式。");
-                return;
-            }
-        };
+        run_threshold_mode(args, &challenge)?;
+    }
+    Ok(())
+}
 
-        eprintln!("EPYC 7K62阈值模式启动...");
-        println!(
-            "进入阈值模式... Challenge: '{}', 阈值: {}, 搜索范围: [{}..{}]",
-            challenge,
-            threshold,
-            args.start,
-            args.start + args.count - 1
-        );
+fn run_stream_mode(args: Args, challenge: &str) -> Result<(), String> {
+    let mut baseline = args.baseline;
+    let mut current_nonce = args.start;
+    let batch_size = args.batch;
+    
+    eprintln!("EPYC 7K62流模式启动...");
+    println!("进入持续模式... Challenge: '{}', 初始基线: {}", challenge, baseline);
 
-        let found_flag = Arc::new(AtomicU32::new(0));
+    loop {
         let start_time = Instant::now();
-        
-        let result = mine_cpu_epyc7k62(&challenge, args.start, args.count, threshold, found_flag);
+        if let Some(res) = mine_cpu_stream_epyc7k62(challenge, current_nonce, batch_size, baseline) {
+            if res.leading_zero_bits > baseline {
+                baseline = res.leading_zero_bits;
+                let output = serde_json::json!({
+                    "mode": "stream_epyc7k62",
+                    "challenge": challenge,
+                    "best": res,
+                    "baseline": baseline,
+                    "cpu_model": "AMD_EPYC_7K62_Dual"
+                });
+                write_output(&output, &args.output, true);
+            }
+        }
         
         let duration = start_time.elapsed();
-        let hashes_per_sec = (args.count as f64 / duration.as_secs_f64()) / 1_000_000.0;
-
+        let hashes_per_sec = (batch_size as f64 / duration.as_secs_f64()) / 1_000_000.0;
+        
+        let next_nonce = current_nonce + batch_size;
         eprintln!(
-            "[EPYC7K62] 搜索完成. 耗时: {:.2?}, 平均算力: {:.1} MH/s",
-            duration, hashes_per_sec
+            "[EPYC7K62] 批次 [{}..{}] 完成. 耗时: {:.2?}, 算力: {:.1} MH/s, 基线: {}",
+            current_nonce,
+            next_nonce - 1,
+            duration,
+            hashes_per_sec,
+            baseline
         );
+        current_nonce = next_nonce;
+    }
+}
 
-        let output = serde_json::json!({
-            "mode": "threshold_epyc7k62",
-            "challenge": challenge,
-            "threshold": threshold,
-            "result": result,
-            "cpu_model": "AMD_EPYC_7K62_Dual",
-            "hashrate_mhs": hashes_per_sec
-        });
-        write_output(&output, &args.output, false);
+fn run_threshold_mode(args: Args, challenge: &str) -> Result<(), String> {
+    let threshold = args.threshold.ok_or("错误: 阈值模式下必须提供 --threshold 参数，或使用 --stream 模式。")?;
+
+    eprintln!("EPYC 7K62阈值模式启动...");
+    println!(
+        "进入阈值模式... Challenge: '{}', 阈值: {}, 搜索范围: [{}..{}]",
+        challenge,
+        threshold,
+        args.start,
+        args.start + args.count - 1
+    );
+
+    let found_flag = Arc::new(AtomicU32::new(0));
+    let start_time = Instant::now();
+    
+    let result = mine_cpu_epyc7k62(challenge, args.start, args.count, threshold, found_flag);
+    
+    let duration = start_time.elapsed();
+    let hashes_per_sec = (args.count as f64 / duration.as_secs_f64()) / 1_000_000.0;
+
+    eprintln!(
+        "[EPYC7K62] 搜索完成. 耗时: {:.2?}, 平均算力: {:.1} MH/s",
+        duration, hashes_per_sec
+    );
+
+    let output = serde_json::json!({
+        "mode": "threshold_epyc7k62",
+        "challenge": challenge,
+        "threshold": threshold,
+        "result": result,
+        "cpu_model": "AMD_EPYC_7K62_Dual",
+        "hashrate_mhs": hashes_per_sec
+    });
+    write_output(&output, &args.output, false);
+    Ok(())
+}
+
+fn main() {
+    let args = Args::parse();
+    if let Err(e) = run(args) {
+        eprintln!("{}", e);
+        std::process::exit(1);
     }
 }
 

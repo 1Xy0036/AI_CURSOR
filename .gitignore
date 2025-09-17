@@ -10,6 +10,7 @@ venv
 
 # Application-specific cache
 pow_results_cache.json
+results.log
 
 # Editor/OS-specific files
 .vscode/
