@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Python cache and virtual environment
+__pycache__/
+*.py[cod]
+.venv
+venv
+*venv
+
+# Application-specific cache
+pow_results_cache.json
+
+# Editor/OS-specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
