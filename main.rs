@@ -3,14 +3,16 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::arch::x86_64::*;
 
 const MAX_CHALLENGE_LEN: usize = 96;
-// AMD EPYC 7K62 特定优化：48核心×2插槽，L3缓存192MB，8内存通道×2
-const NUMA_BATCH_SIZE: usize = 8192;    // NUMA感知批处理
+// 超大批处理 - 专为高难度优化
+const ULTRA_BATCH_SIZE: usize = 1024 * 1024;  // 1M批处理，减少10倍同步
+const CACHE_LINE_SIZE: usize = 64;
 
-/// 定义命令行参数结构
+/// 命令行参数 - 添加高难度专用选项
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -22,11 +24,11 @@ struct Args {
     #[arg(long)]
     vout: u32,
 
-    /// 前导零位阈值 (与 --stream 互斥)
+    /// 前导零位阈值
     #[arg(long, short)]
     threshold: Option<u32>,
 
-    /// 持续模式：不设阈值，发现更优即打印一次
+    /// 持续模式
     #[arg(long, action)]
     stream: bool,
 
@@ -34,29 +36,36 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     start: u64,
 
-    /// 一次性扫描 nonce 数 (阈值模式)
-    #[arg(long, default_value_t = 50_000_000)]
+    /// 搜索数量
+    #[arg(long, default_value_t = 1000_000_000)]
     count: u64,
 
-    /// 每轮批大小 (持续模式) - 针对7K62优化
-    #[arg(long, default_value_t = 20_000_000)]
+    /// 批处理大小 - 专为高难度优化
+    #[arg(long, default_value_t = 1000_000_000)]
     batch: u64,
 
-    /// 持续模式初始基线 (前导零位)
+    /// 基线难度
     #[arg(long, default_value_t = 0)]
     baseline: u32,
 
-    /// 线程池大小 (0 = auto, 建议96用于双7K62)
+    /// 线程数
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// NUMA节点绑定 (0: 自动, 1: 单节点, 2: 双节点交错)
-    #[arg(long, default_value_t = 2)]
-    numa_mode: u8,
+    /// 启用超级优化模式 (专为10+零优化)
+    #[arg(long, action, default_value_t = true)]
+    ultra_mode: bool,
 
-    /// 将JSON结果保存到指定文件而不是打印到标准输出
+    /// 自适应批处理 (根据难度动态调整)
+    #[arg(long, action, default_value_t = true)]
+    adaptive_batch: bool,
+
+    /// 输出文件
     #[arg(long, short)]
     output: Option<String>,
+    /// 内部并行块大小
+    #[arg(long, default_value_t = 65536)]
+    chunk_size: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -66,25 +75,104 @@ struct PowResult {
     leading_zero_bits: u32,
 }
 
-/// 针对AMD Zen2架构优化的前导零位计算
-/// 利用AMD的出色整数执行单元和64位ALU
+/// 高难度专用统计 - 追踪不同难度级别的性能
+#[derive(Debug)]
+struct HighDifficultyStats {
+    total_hashes: AtomicU64,
+    high_difficulty_hashes: AtomicU64,  // 10+零的专用计数
+    best_found: AtomicU32,
+    start_time: Instant,
+    early_exit_enabled: AtomicBool,     // 智能早退机制
+}
+
+impl HighDifficultyStats {
+    fn new() -> Self {
+        Self {
+            total_hashes: AtomicU64::new(0),
+            high_difficulty_hashes: AtomicU64::new(0),
+            best_found: AtomicU32::new(0),
+            start_time: Instant::now(),
+            early_exit_enabled: AtomicBool::new(false),
+        }
+    }
+
+    fn add_hashes(&self, count: u64, is_high_difficulty: bool) {
+        self.total_hashes.fetch_add(count, Ordering::Relaxed);
+        if is_high_difficulty {
+            self.high_difficulty_hashes.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    fn update_best(&self, new_best: u32) {
+        self.best_found.store(new_best, Ordering::Release);
+        
+        // 高难度时启用早退机制
+        if new_best >= 10 {
+            self.early_exit_enabled.store(true, Ordering::Release);
+        }
+    }
+
+    fn calculate_adaptive_batch_size(&self) -> usize {
+        let current_best = self.best_found.load(Ordering::Acquire);
+        let base_size = ULTRA_BATCH_SIZE;
+        
+        // 根据当前最佳难度动态调整批处理大小
+        match current_best {
+            0..=7 => base_size,                    // 低难度：标准批处理
+            8..=10 => base_size * 2,              // 中难度：2倍批处理
+            11..=15 => base_size * 4,             // 高难度：4倍批处理
+            16..=20 => base_size * 8,             // 极高难度：8倍批处理
+            _ => base_size * 16,                  // 超高难度：16倍批处理
+        }
+    }
+
+    fn get_hashrate_mhs(&self) -> f64 {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let total = self.total_hashes.load(Ordering::Relaxed);
+        if elapsed > 0.0 {
+            (total as f64) / (elapsed * 1_000_000.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn get_high_difficulty_ratio(&self) -> f64 {
+        let total = self.total_hashes.load(Ordering::Relaxed);
+        let high_diff = self.high_difficulty_hashes.load(Ordering::Relaxed);
+        if total > 0 {
+            (high_diff as f64) / (total as f64)
+        } else {
+            0.0
+        }
+    }
+}
+
+static GLOBAL_STATS: OnceLock<HighDifficultyStats> = OnceLock::new();
+
+fn get_global_stats() -> &'static HighDifficultyStats {
+    GLOBAL_STATS.get_or_init(|| HighDifficultyStats::new())
+}
+
+/// 专为高难度优化的前导零计算 - 早期快速过滤
 #[inline(always)]
-fn count_leading_zero_bits_zen2(hash: &[u8; 32]) -> u32 {
-    let mut zero_bits = 0u32;
+fn count_leading_zeros_high_difficulty_optimized(hash: &[u8; 32]) -> u32 {
+    // 快速检查：如果前4字节不全为零，直接返回较小值
+    let first_u32 = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    if first_u32 != 0 {
+        return first_u32.leading_zeros();
+    }
     
-    // AMD Zen2架构对64位操作优化很好，直接使用u64处理
-    // 避免分支预测失败，使用位运算技巧
+    // 前4字节全零，继续检查剩余部分
     let hash_u64 = unsafe {
         std::slice::from_raw_parts(hash.as_ptr() as *const u64, 4)
     };
     
-    // 利用AMD的快速整数运算单元
+    let mut zero_bits = 0u32;
     for &quad in hash_u64 {
-        let be_quad = u64::from_be(quad);
-        if be_quad == 0 {
+        if quad == 0 {
             zero_bits += 64;
         } else {
-            zero_bits += be_quad.leading_zeros();
+            zero_bits += quad.to_be().leading_zeros();
             break;
         }
     }
@@ -92,226 +180,413 @@ fn count_leading_zero_bits_zen2(hash: &[u8; 32]) -> u32 {
     zero_bits
 }
 
-/// AMD EPYC 7K62 NUMA感知的挑战前缀结构
-/// 考虑L3缓存大小和内存带宽
-struct NumaAwareChallengePrefix {
-    data: [u8; MAX_CHALLENGE_LEN + 20],
-    challenge_len: usize,
-    // 添加填充以避免false sharing，AMD架构缓存行64字节
-    _padding: [u8; 64],
+/// 高难度专用SIMD优化 - AVX2 + 早期过滤
+#[inline(always)]
+fn count_leading_zeros_high_diff_simd(hash: &[u8; 32]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    // 优先使用 AVX-512，它在支持的硬件上性能最佳。
+    // AVX512BW (Byte/Word) 提供了我们需要的 epi8 比较指令。
+    // AVX512VL 允许这些指令在 256 位向量上操作。
+    if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+        unsafe {
+            return count_leading_zeros_avx512(hash);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
+            return count_leading_zeros_avx2_high_diff(hash);
+        }
+    }
+    
+    count_leading_zeros_high_difficulty_optimized(hash)
 }
 
-impl NumaAwareChallengePrefix {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn count_leading_zeros_avx2_high_diff(hash: &[u8; 32]) -> u32 {
+    // 使用AVX2快速检查整个32字节
+    let data_ptr = hash.as_ptr() as *const __m128i;
+    let first_half = _mm_loadu_si128(data_ptr);
+    let second_half = _mm_loadu_si128(data_ptr.add(1));
+    let zero_vec = _mm_setzero_si128();
+    
+    // 比较两个128位向量是否为零
+    let cmp1 = _mm_cmpeq_epi8(first_half, zero_vec);
+    let cmp2 = _mm_cmpeq_epi8(second_half, zero_vec);
+    
+    // 将比较结果合并成一个32位掩码
+    let mask1 = _mm_movemask_epi8(cmp1) as u32;
+    let mask2 = _mm_movemask_epi8(cmp2) as u32;
+    let mask = (mask2 << 16) | mask1;
+
+    // `!mask` 会找到第一个非零字节的位置
+    let first_nonzero_byte_idx = (!mask).trailing_zeros();
+    if first_nonzero_byte_idx >= 32 {
+        256 // 所有字节都为零
+    } else {
+        first_nonzero_byte_idx * 8 + hash[first_nonzero_byte_idx as usize].leading_zeros()
+    }
+}
+
+/// AVX-512 (BW/VL) 优化版本，用于计算前导零。
+/// 这是目前x86_64平台上最高效的实现。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn count_leading_zeros_avx512(hash: &[u8; 32]) -> u32 {
+    // 使用 _mm256_loadu_si256 一次性加载整个32字节哈希到 ymm 寄存器。
+    let data_vec = _mm256_loadu_si256(hash.as_ptr() as *const __m256i);
+    let zero_vec = _mm256_setzero_si256();
+
+    // _mm256_cmpeq_epi8_mask 直接比较32个字节，并返回一个 u32 掩码。
+    // 如果一个字节为0，则对应位为1，否则为0。
+    let mask = _mm256_cmpeq_epi8_mask(data_vec, zero_vec);
+
+    // `!mask` 将掩码反转，第一个非零字节对应的位现在是0，其他是1。
+    // `_tzcnt_u32` (trailing_zeros) 会找到第一个0的位置，即第一个非零字节的索引。
+    // 这个指令来自 BMI1，比迭代查找快得多。
+    let first_nonzero_byte_idx = _tzcnt_u32(!mask);
+
+    // 如果所有字节都为零 (idx >= 32)，则返回256。否则计算总的前导零位数。
+    first_nonzero_byte_idx * 8 + hash.get(first_nonzero_byte_idx as usize).map_or(0, |&b| b.leading_zeros())
+}
+
+/// 超高性能挑战前缀 - 专为高难度优化
+#[repr(align(64))]
+struct HighDifficultyPrefix {
+    data: [u8; MAX_CHALLENGE_LEN + 32],
+    challenge_len: usize,
+    _padding: [u8; CACHE_LINE_SIZE],
+}
+
+impl HighDifficultyPrefix {
     fn new(challenge: &str) -> Self {
-        let mut data = [0u8; MAX_CHALLENGE_LEN + 20];
+        let mut data = [0u8; MAX_CHALLENGE_LEN + 32];
         let challenge_bytes = challenge.as_bytes();
         let challenge_len = challenge_bytes.len();
         data[..challenge_len].copy_from_slice(challenge_bytes);
         
-        Self { 
-            data, 
-            challenge_len,
-            _padding: [0; 64]
-        }
-    }
-    
-    #[inline(always)]
-    fn create_message(&mut self, nonce: u64) -> &[u8] {
-        // 使用 itoa crate 进行高效的、无堆分配的整数到字符串转换
-        // itoa::Buffer 是一个 [u8; 20] 的封装
-        let mut buffer = itoa::Buffer::new();
-        let nonce_bytes = buffer.format(nonce).as_bytes();
-        let nonce_len = nonce_bytes.len();
-
-        let message_len = self.challenge_len + nonce_len;
-        self.data[self.challenge_len..message_len]
-            .copy_from_slice(nonce_bytes);
-
-        &self.data[..message_len]
-    }
-}
-
-/// 针对AMD EPYC 7K62优化的SHA256计算器
-/// 考虑Zen2微架构的特点：强大的整数单元，预取器，分支预测
-struct Zen2OptimizedHasher {
-    hasher1: Sha256,
-    hasher2: Sha256,
-    // 预分配缓冲区，对齐到64字节（缓存行大小）
-    _padding: [u8; 64],
-}
-
-impl Zen2OptimizedHasher {
-    fn new() -> Self {
         Self {
-            hasher1: Sha256::new(),
-            hasher2: Sha256::new(),
-            _padding: [0; 64],
+            data,
+            challenge_len,
+            _padding: [0u8; CACHE_LINE_SIZE],
         }
     }
     
+    /// 超高效批量消息创建 - 针对高难度优化
     #[inline(always)]
-    fn double_sha256(&mut self, input: &[u8]) -> [u8; 32] {
-        // 重用hasher实例，减少初始化开销
-        self.hasher1.reset();
-        Digest::update(&mut self.hasher1, input);
-        let hash1 = self.hasher1.finalize_reset();
-        
-        self.hasher2.reset();
-        Digest::update(&mut self.hasher2, &hash1);
-        self.hasher2.finalize_reset().into()
+    fn create_message_mega_batch(&mut self, start_nonce: u64, batch_size: usize, 
+                                messages: &mut [[u8; MAX_CHALLENGE_LEN + 32]], 
+                                message_lengths: &mut [usize]) {
+        // 使用SIMD友好的批处理方式
+        for i in 0..batch_size {
+            let nonce = start_nonce + i as u64;
+            let mut buffer = itoa::Buffer::new();
+            let nonce_str = buffer.format(nonce);
+            let nonce_bytes = nonce_str.as_bytes();
+            let nonce_len = nonce_bytes.len();
+            
+            let message_len = self.challenge_len + nonce_len;
+            
+            // 优化的内存拷贝
+            messages[i][..self.challenge_len].copy_from_slice(&self.data[..self.challenge_len]);
+            messages[i][self.challenge_len..message_len].copy_from_slice(nonce_bytes);
+            message_lengths[i] = message_len;
+            
+            // 清零剩余部分确保一致性
+            messages[i][message_len..].fill(0);
+        }
     }
 }
 
-/// AMD EPYC 7K62 NUMA优化的工作线程函数
-/// 充分利用96核心（48×2）和8内存通道×2的优势
-fn mine_cpu_epyc7k62(
+/// 高难度专用SHA256处理器 - 智能早退
+struct HighDifficultySha256Processor {
+    hashers: Vec<(Sha256, Sha256)>,
+}
+
+impl HighDifficultySha256Processor {
+    fn new(batch_size: usize) -> Self {
+        let mut hashers = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            hashers.push((Sha256::new(), Sha256::new()));
+        }
+        
+        Self { hashers }
+    }
+    
+    /// 高难度批量处理 - 带早退优化
+    #[inline(always)]
+    fn batch_process_high_difficulty(&mut self, 
+                                   messages: &[[u8; MAX_CHALLENGE_LEN + 32]], 
+                                   lengths: &[usize], 
+                                   results: &mut [[u8; 32]],
+                                   start_nonce: u64,
+                                   threshold: u32) -> Option<PowResult> {
+        
+        let batch_size = messages.len();
+        let early_exit = get_global_stats().early_exit_enabled.load(Ordering::Acquire);
+        
+        for i in 0..batch_size {
+            let (hasher1, hasher2) = &mut self.hashers[i];
+            
+            // 第一轮SHA256
+            hasher1.reset();
+            hasher1.update(&messages[i][..lengths[i]]);
+            let hash1 = hasher1.finalize_reset();
+            
+            // 高难度模式：在第一轮后快速检查
+            if early_exit && threshold >= 10 {
+                let partial_zeros = u32::from_be_bytes([hash1[0], hash1[1], hash1[2], hash1[3]]).leading_zeros();
+                if partial_zeros < threshold - 8 {
+                    continue; // 第一轮就不符合，跳过第二轮
+                }
+            }
+            
+            // 第二轮SHA256
+            hasher2.reset();
+            hasher2.update(&hash1);
+            results[i] = hasher2.finalize_reset().into();
+            
+            // 立即检查结果
+            let leading_zeros = count_leading_zeros_high_diff_simd(&results[i]);
+            
+            if leading_zeros >= threshold {
+                return Some(PowResult {
+                    nonce: start_nonce + i as u64,
+                    hash_hex: hex::encode(results[i]),
+                    leading_zero_bits: leading_zeros,
+                });
+            }
+        }
+        
+        None
+    }
+}
+
+/// 终极高难度挖矿函数 - 专攻10+零
+fn mine_high_difficulty_ultimate(
     challenge: &str,
     start_nonce: u64,
     total_nonces: u64,
     threshold_bits: u32,
-    found_flag: Arc<AtomicU32>,
+    found_flag: Arc<AtomicU32>, // found_flag is not used in stream mode, but kept for signature consistency
+    adaptive_batch: bool,
+    chunk_size_arg: usize,
 ) -> Option<PowResult> {
-    use std::cell::RefCell;
     
-    // 线程本地存储，避免跨NUMA访问
     thread_local! {
-        static HASHER: RefCell<Zen2OptimizedHasher> = RefCell::new(Zen2OptimizedHasher::new());
-        static PREFIX: RefCell<NumaAwareChallengePrefix> = RefCell::new(NumaAwareChallengePrefix::new(""));
+        static PREFIX: std::cell::RefCell<HighDifficultyPrefix> = 
+            std::cell::RefCell::new(HighDifficultyPrefix::new(""));
+        static PROCESSOR: std::cell::RefCell<HighDifficultySha256Processor> = 
+            std::cell::RefCell::new(HighDifficultySha256Processor::new(ULTRA_BATCH_SIZE));
+        static MESSAGES: std::cell::RefCell<Vec<[u8; MAX_CHALLENGE_LEN + 32]>> = 
+            std::cell::RefCell::new(vec![[0u8; MAX_CHALLENGE_LEN + 32]; ULTRA_BATCH_SIZE]);
+        static MESSAGE_LENGTHS: std::cell::RefCell<Vec<usize>> = 
+            std::cell::RefCell::new(vec![0usize; ULTRA_BATCH_SIZE]);
+        static RESULTS: std::cell::RefCell<Vec<[u8; 32]>> = 
+            std::cell::RefCell::new(vec![[0u8; 32]; ULTRA_BATCH_SIZE]);
     }
     
-    // 使用NUMA感知的批处理大小，转换为usize范围
-    let chunk_size = std::cmp::min(NUMA_BATCH_SIZE, total_nonces as usize);
+    let is_high_difficulty = threshold_bits >= 10;
     
-    // 边界情况处理：如果总数为0或块大小为0，则无需搜索
-    if total_nonces == 0 || chunk_size == 0 {
-        return None;
-    }
+    // 动态批处理大小
+    let mut chunk_size = if adaptive_batch && chunk_size_arg == 65536 {
+        get_global_stats().calculate_adaptive_batch_size()
+    } else {
+        chunk_size_arg
+    };
+    // 确保内部块大小不超过线程本地缓冲区的容量
+    chunk_size = chunk_size.min(ULTRA_BATCH_SIZE).min(total_nonces as usize);
+    
+    if chunk_size == 0 { return None; }
     
     (0..total_nonces as usize)
         .into_par_iter()
         .chunks(chunk_size)
         .find_map_any(|chunk_indices| {
+            let chunk_start_nonce = start_nonce + chunk_indices[0] as u64;
+            let actual_batch_size = chunk_indices.len();
+            
             PREFIX.with(|p| {
                 let mut prefix = p.borrow_mut();
-                *prefix = NumaAwareChallengePrefix::new(challenge);
-                
-                HASHER.with(|h| {
-                    let mut hasher = h.borrow_mut();
-                    
-                    // 使用 find() 使代码更简洁，它会在找到第一个 Some(T) 时停止
-                    chunk_indices.iter().find_map(|&idx| {
-                         let nonce = start_nonce + idx as u64;
-                         // 早期退出检查 - AMD的分支预测器很好
-                         let current_best = found_flag.load(Ordering::Acquire);
-                         if current_best >= threshold_bits {
-                             return None; // 提前终止此 chunk 的搜索
-                         }
+                if prefix.challenge_len == 0 {
+                    *prefix = HighDifficultyPrefix::new(challenge);
+                }
 
-                         let message = prefix.create_message(nonce);
-                         let hash_array = hasher.double_sha256(message);
-                         let leading_zeros = count_leading_zero_bits_zen2(&hash_array);
+                PROCESSOR.with(|proc| {
+                    MESSAGES.with(|msgs| {
+                        MESSAGE_LENGTHS.with(|lens| {
+                            RESULTS.with(|res| {
+                                let mut processor = proc.borrow_mut();
+                                let mut messages = msgs.borrow_mut();
+                                let mut message_lengths = lens.borrow_mut();
+                                let mut results = res.borrow_mut();
 
-                         if leading_zeros >= threshold_bits {
-                             found_flag.store(leading_zeros, Ordering::Release);
-                             Some(PowResult {
-                                 nonce,
-                                 hash_hex: hex::encode(hash_array),
-                                 leading_zero_bits: leading_zeros,
-                             })
-                         } else {
-                             None
-                         }
+                                // 创建批量消息
+                                prefix.create_message_mega_batch(
+                                    chunk_start_nonce, 
+                                    actual_batch_size, 
+                                    &mut messages[..actual_batch_size], 
+                                    &mut message_lengths[..actual_batch_size]
+                                );
+
+                                // 高难度优化处理
+                                let result = processor.batch_process_high_difficulty(
+                                    &messages[..actual_batch_size],
+                                    &message_lengths[..actual_batch_size],
+                                    &mut results[..actual_batch_size],
+                                    chunk_start_nonce,
+                                    threshold_bits
+                                );
+
+                                // 更新统计
+                                get_global_stats().add_hashes(actual_batch_size as u64, is_high_difficulty);
+
+                                // 检查是否找到结果
+                                if let Some(ref found_result) = result {
+                                    found_flag.store(found_result.leading_zero_bits, Ordering::Release);
+                                    get_global_stats().update_best(found_result.leading_zero_bits);
+                                }
+
+                                result
+                            })
+                        })
                     })
                 })
             })
         })
 }
 
-/// EPYC 7K62优化的流模式挖掘
-fn mine_cpu_stream_epyc7k62(
+/// 高难度流模式 - 智能难度攀升
+fn mine_high_difficulty_stream(
     challenge: &str,
     start_nonce: u64,
     total_nonces: u64,
     baseline_bits: u32,
+    adaptive_batch: bool,
+    chunk_size_arg: usize,
 ) -> Option<PowResult> {
-    use std::cell::RefCell;
-
-    // 线程本地存储，避免在每个chunk中重复创建对象
+    
     thread_local! {
-        static HASHER: RefCell<Zen2OptimizedHasher> = RefCell::new(Zen2OptimizedHasher::new());
-        static PREFIX: RefCell<NumaAwareChallengePrefix> = RefCell::new(NumaAwareChallengePrefix::new(""));
+        static PREFIX: std::cell::RefCell<HighDifficultyPrefix> = 
+            std::cell::RefCell::new(HighDifficultyPrefix::new(""));
+        static PROCESSOR: std::cell::RefCell<HighDifficultySha256Processor> = 
+            std::cell::RefCell::new(HighDifficultySha256Processor::new(ULTRA_BATCH_SIZE));
+        static MESSAGES: std::cell::RefCell<Vec<[u8; MAX_CHALLENGE_LEN + 32]>> = 
+            std::cell::RefCell::new(vec![[0u8; MAX_CHALLENGE_LEN + 32]; ULTRA_BATCH_SIZE]);
+        static MESSAGE_LENGTHS: std::cell::RefCell<Vec<usize>> = 
+            std::cell::RefCell::new(vec![0usize; ULTRA_BATCH_SIZE]);
+        static RESULTS: std::cell::RefCell<Vec<[u8; 32]>> = 
+            std::cell::RefCell::new(vec![[0u8; 32]; ULTRA_BATCH_SIZE]);
     }
 
-    // 原子地追踪当前找到的最佳结果，以减少通信开销
     let current_best_bits = Arc::new(AtomicU32::new(baseline_bits));
+    let is_high_difficulty = baseline_bits >= 10;
     
-    // 使用 reduce 代替 collect，直接在并行计算中找到最优解，减少内存分配
+    let mut chunk_size = if adaptive_batch && chunk_size_arg == 65536 { // Only use adaptive if chunk_size is default
+        get_global_stats().calculate_adaptive_batch_size()
+    } else {
+        chunk_size_arg
+    };
+    // 确保内部块大小不超过线程本地缓冲区的容量
+    chunk_size = chunk_size.min(ULTRA_BATCH_SIZE).min(total_nonces as usize);
+    
     (0..total_nonces as usize)
         .into_par_iter()
-        .chunks(NUMA_BATCH_SIZE)
-        .filter_map(|chunk_indices| { // 每个线程会处理多个chunk
+        .chunks(chunk_size)
+        .filter_map(|chunk_indices| {
+            let chunk_start_nonce = start_nonce + chunk_indices[0] as u64;
+            let actual_batch_size = chunk_indices.len();
+            
             PREFIX.with(|p| {
                 let mut prefix = p.borrow_mut();
-                *prefix = NumaAwareChallengePrefix::new(challenge); // 每个批次开始时更新challenge
+                if prefix.challenge_len == 0 {
+                    *prefix = HighDifficultyPrefix::new(challenge);
+                }
 
-                HASHER.with(|h| {
-                    let mut hasher = h.borrow_mut();
-                    let mut local_best: Option<PowResult> = None;
+                PROCESSOR.with(|proc| {
+                    MESSAGES.with(|msgs| {
+                        MESSAGE_LENGTHS.with(|lens| {
+                            RESULTS.with(|res| {
+                                let mut processor = proc.borrow_mut();
+                                let mut messages = msgs.borrow_mut();
+                                let mut message_lengths = lens.borrow_mut();
+                                let mut results = res.borrow_mut();
 
-                    for idx in chunk_indices {
-                        let nonce = start_nonce + idx as u64;
-                        let current_best = current_best_bits.load(Ordering::Relaxed);
+                                prefix.create_message_mega_batch(
+                                    chunk_start_nonce, 
+                                    actual_batch_size, 
+                                    &mut messages[..actual_batch_size], 
+                                    &mut message_lengths[..actual_batch_size]
+                                );
 
-                        let message = prefix.create_message(nonce);
-                        let hash_array = hasher.double_sha256(message);
-                        let leading_zeros = count_leading_zero_bits_zen2(&hash_array);
-                        
-                        if leading_zeros > current_best && (local_best.is_none() || leading_zeros > local_best.as_ref().unwrap().leading_zero_bits) {
-                            current_best_bits.fetch_max(leading_zeros, Ordering::Relaxed);
-                            local_best = Some(PowResult {
-                                nonce,
-                                hash_hex: hex::encode(hash_array),
-                                leading_zero_bits: leading_zeros,
-                            });
-                        }
-                    }
-                    local_best
+                                // 批量计算SHA256
+                                for i in 0..actual_batch_size {
+                                    let (hasher1, hasher2) = &mut processor.hashers[i];
+                                    
+                                    hasher1.reset();
+                                    hasher1.update(&messages[i][..message_lengths[i]]);
+                                    let hash1 = hasher1.finalize_reset();
+                                    
+                                    hasher2.reset();
+                                    hasher2.update(&hash1);
+                                    results[i] = hasher2.finalize_reset().into();
+                                }
+
+                                get_global_stats().add_hashes(actual_batch_size as u64, is_high_difficulty);
+
+                                // 寻找最佳结果
+                                let mut local_best: Option<PowResult> = None;
+                                let current_best = current_best_bits.load(Ordering::Acquire);
+
+                                for i in 0..actual_batch_size {
+                                    let leading_zeros = count_leading_zeros_high_diff_simd(&results[i]);
+                                    
+                                    if leading_zeros > current_best && 
+                                       (local_best.is_none() || leading_zeros > local_best.as_ref().unwrap().leading_zero_bits) {
+                                        current_best_bits.fetch_max(leading_zeros, Ordering::Relaxed);
+                                        get_global_stats().update_best(leading_zeros);
+                                        
+                                        local_best = Some(PowResult {
+                                            nonce: chunk_start_nonce + i as u64,
+                                            hash_hex: hex::encode(results[i]),
+                                            leading_zero_bits: leading_zeros,
+                                        });
+                                    }
+                                }
+                                
+                                local_best
+                            })
+                        })
+                    })
                 })
             })
         })
         .reduce_with(|a, b| if a.leading_zero_bits >= b.leading_zero_bits { a } else { b })
 }
 
-fn setup_epyc7k62_environment(args: &Args) {
-    // 针对AMD EPYC 7K62的线程池配置
+fn setup_high_difficulty_environment(args: &Args) {
     let thread_count = if args.threads > 0 {
         args.threads
     } else {
-        // 双路EPYC 7K62: 48核心×2×2线程 = 192线程
-        // 但对于CPU密集型任务，通常物理核心数效果更好
-        match args.numa_mode {
-            1 => 48,  // 单NUMA节点
-            2 => 96,  // 双NUMA节点，每核心一个线程
-            _ => 96,  // 默认配置
-        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(96)
+            .min(128)
     };
     
     rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
-        .thread_name(|i| format!("epyc7k62-worker-{}", i))
+        .thread_name(|i| format!("high-diff-{}", i))
         .build_global()
-        .expect("Failed to build thread pool for EPYC 7K62");
+        .expect("Failed to build high difficulty thread pool");
     
-    eprintln!("EPYC 7K62优化配置: {} 工作线程, NUMA模式: {}", thread_count, args.numa_mode);
+    eprintln!("🚀 高难度优化配置: {} 线程, 超级模式: {}, 自适应批处理: {}", 
+        thread_count, args.ultra_mode, args.adaptive_batch);
 }
 
-/// 将结果写入文件或标准输出
 fn write_output(output_json: &serde_json::Value, output_path: &Option<String>, append: bool) {
-    // to_string_pretty is slightly nicer for file logs, but to_string is fine for performance.
-    let output_string = match serde_json::to_string_pretty(output_json) {
-        Ok(s) => s,
-        Err(_) => serde_json::to_string(output_json).unwrap(), // Fallback
-    };
+    let output_string = serde_json::to_string_pretty(output_json).unwrap();
 
     if let Some(path) = output_path {
         use std::fs::OpenOptions;
@@ -330,10 +605,8 @@ fn write_output(output_json: &serde_json::Value, output_path: &Option<String>, a
     }
 }
 
-/// 运行程序的主逻辑，返回Result以便于错误处理
 fn run(args: Args) -> Result<(), String> {
-    // 设置针对EPYC 7K62优化的环境
-    setup_epyc7k62_environment(&args);
+    setup_high_difficulty_environment(&args);
 
     if args.threshold.is_some() && args.stream {
         return Err("错误: --threshold 和 --stream 参数是互斥的。".to_string());
@@ -341,65 +614,90 @@ fn run(args: Args) -> Result<(), String> {
 
     let challenge = format!("{}:{}", args.txid, args.vout);
     if challenge.len() > MAX_CHALLENGE_LEN {
-        return Err(format!("错误: txid 过长，导致 challenge 长度超过 {} 字节。", MAX_CHALLENGE_LEN));
+        return Err(format!("错误: challenge 长度超过 {} 字节。", MAX_CHALLENGE_LEN));
     }
 
     if args.stream {
-        // --- 持续模式 (EPYC 7K62优化) ---
-        run_stream_mode(args, &challenge)?;
+        run_stream_mode_high_difficulty(args, &challenge)?;
     } else {
-        // --- 阈值模式 (EPYC 7K62优化) ---
-        run_threshold_mode(args, &challenge)?;
+        run_threshold_mode_high_difficulty(args, &challenge)?;
     }
     Ok(())
 }
 
-fn run_stream_mode(args: Args, challenge: &str) -> Result<(), String> {
+fn run_stream_mode_high_difficulty(args: Args, challenge: &str) -> Result<(), String> {
     let mut baseline = args.baseline;
     let mut current_nonce = args.start;
     let batch_size = args.batch;
+
+    if batch_size == 0 {
+        return Err("错误: --batch 大小不能为0。".to_string());
+    }
     
-    eprintln!("EPYC 7K62流模式启动...");
-    println!("进入持续模式... Challenge: '{}', 初始基线: {}", challenge, baseline);
+    eprintln!("🚀 高难度流模式启动...");
+    println!("进入高难度持续模式... Challenge: '{}', 初始基线: {}", challenge, baseline);
 
     loop {
         let start_time = Instant::now();
-        if let Some(res) = mine_cpu_stream_epyc7k62(challenge, current_nonce, batch_size, baseline) {
+        if let Some(res) = mine_high_difficulty_stream(
+            challenge, 
+            current_nonce, 
+            batch_size, 
+            baseline,
+            args.adaptive_batch,
+            args.chunk_size,
+        ) {
             if res.leading_zero_bits > baseline {
                 baseline = res.leading_zero_bits;
+                let hashrate = get_global_stats().get_hashrate_mhs();
+                let high_diff_ratio = get_global_stats().get_high_difficulty_ratio();
+                let adaptive_size = get_global_stats().calculate_adaptive_batch_size();
+                
                 let output = serde_json::json!({
-                    "mode": "stream_epyc7k62",
+                    "mode": "high_difficulty_stream",
                     "challenge": challenge,
                     "best": res,
                     "baseline": baseline,
-                    "cpu_model": "AMD_EPYC_7K62_Dual"
+                    "cpu_model": "AMD_EPYC_7K62_HighDiff",
+                    "hashrate_mhs": hashrate,
+                    "high_difficulty_ratio": high_diff_ratio,
+                    "adaptive_batch_size": adaptive_size,
+                    "optimizations": {
+                        "ultra_mode": args.ultra_mode,
+                        "adaptive_batch": args.adaptive_batch,
+                        "early_exit": baseline >= 10
+                    }
                 });
                 write_output(&output, &args.output, true);
             }
         }
         
         let duration = start_time.elapsed();
-        let hashes_per_sec = (batch_size as f64 / duration.as_secs_f64()) / 1_000_000.0;
+        let current_hashrate = (batch_size as f64 / duration.as_secs_f64()) / 1_000_000.0;
+        let global_hashrate = get_global_stats().get_hashrate_mhs();
+        let adaptive_size = get_global_stats().calculate_adaptive_batch_size();
         
         let next_nonce = current_nonce + batch_size;
         eprintln!(
-            "[EPYC7K62] 批次 [{}..{}] 完成. 耗时: {:.2?}, 算力: {:.1} MH/s, 基线: {}",
+            "[高难度] 批次 [{}..{}] 完成. 耗时: {:.2?}, 当前: {:.1} MH/s, 全局: {:.1} MH/s, 基线: {}, 批处理: {}",
             current_nonce,
             next_nonce - 1,
             duration,
-            hashes_per_sec,
-            baseline
+            current_hashrate,
+            global_hashrate,
+            baseline,
+            adaptive_size
         );
         current_nonce = next_nonce;
     }
 }
 
-fn run_threshold_mode(args: Args, challenge: &str) -> Result<(), String> {
-    let threshold = args.threshold.ok_or("错误: 阈值模式下必须提供 --threshold 参数，或使用 --stream 模式。")?;
+fn run_threshold_mode_high_difficulty(args: Args, challenge: &str) -> Result<(), String> {
+    let threshold = args.threshold.ok_or("错误: 阈值模式下必须提供 --threshold 参数。")?;
 
-    eprintln!("EPYC 7K62阈值模式启动...");
+    eprintln!("🚀 高难度阈值模式启动...");
     println!(
-        "进入阈值模式... Challenge: '{}', 阈值: {}, 搜索范围: [{}..{}]",
+        "进入高难度阈值模式... Challenge: '{}', 阈值: {}, 搜索范围: [{}..{}]",
         challenge,
         threshold,
         args.start,
@@ -409,23 +707,42 @@ fn run_threshold_mode(args: Args, challenge: &str) -> Result<(), String> {
     let found_flag = Arc::new(AtomicU32::new(0));
     let start_time = Instant::now();
     
-    let result = mine_cpu_epyc7k62(challenge, args.start, args.count, threshold, found_flag);
+    let result = mine_high_difficulty_ultimate(
+        challenge, 
+        args.start, 
+        args.count, 
+        threshold, 
+        found_flag,
+        args.adaptive_batch,
+        args.chunk_size,
+    );
     
     let duration = start_time.elapsed();
-    let hashes_per_sec = (args.count as f64 / duration.as_secs_f64()) / 1_000_000.0;
+    let global_hashrate = get_global_stats().get_hashrate_mhs();
+    let high_diff_ratio = get_global_stats().get_high_difficulty_ratio();
 
     eprintln!(
-        "[EPYC7K62] 搜索完成. 耗时: {:.2?}, 平均算力: {:.1} MH/s",
-        duration, hashes_per_sec
+        "[高难度] 搜索完成. 耗时: {:.2?}, 平均算力: {:.1} MH/s, 高难度占比: {:.1}%",
+        duration, global_hashrate, high_diff_ratio * 100.0
     );
 
     let output = serde_json::json!({
-        "mode": "threshold_epyc7k62",
+        "mode": "high_difficulty_threshold",
         "challenge": challenge,
         "threshold": threshold,
         "result": result,
-        "cpu_model": "AMD_EPYC_7K62_Dual",
-        "hashrate_mhs": hashes_per_sec
+        "cpu_model": "AMD_EPYC_7K62_HighDiff",
+        "hashrate_mhs": global_hashrate,
+        "duration_secs": duration.as_secs_f64(),
+        "total_hashes": get_global_stats().total_hashes.load(Ordering::Relaxed),
+        "high_difficulty_hashes": get_global_stats().high_difficulty_hashes.load(Ordering::Relaxed),
+        "high_difficulty_ratio": high_diff_ratio,
+        "optimizations": {
+            "ultra_mode": args.ultra_mode,
+            "adaptive_batch": args.adaptive_batch,
+            "early_exit_enabled": threshold >= 10,
+            "batch_size": get_global_stats().calculate_adaptive_batch_size()
+        }
     });
     write_output(&output, &args.output, false);
     Ok(())
@@ -444,22 +761,178 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_count_leading_zeros_zen2() {
-        let mut hash1 = [0u8; 32];
-        assert_eq!(count_leading_zero_bits_zen2(&hash1), 256);
+    fn test_high_difficulty_leading_zeros() {
+        // 测试不同难度的前导零计算
+        let mut hash_easy = [0u8; 32];
+        hash_easy[0] = 0x0f;
+        assert_eq!(count_leading_zeros_high_difficulty_optimized(&hash_easy), 4);
 
-        hash1[0] = 0b0000_1111;
-        assert_eq!(count_leading_zero_bits_zen2(&hash1), 4);
+        // 测试10个零的情况 (前5个字节为0, 第6个字节为0x0f)
+        let mut hash_10_zeros = [0u8; 32];
+        hash_10_zeros[0] = 0x00;
+        hash_10_zeros[1] = 0x03; // 6位前导零，总共8+6=14位
+        assert_eq!(count_leading_zeros_high_difficulty_optimized(&hash_10_zeros), 14);
 
-        let mut hash2 = [0u8; 32];
-        hash2[0] = 0xff;
-        assert_eq!(count_leading_zero_bits_zen2(&hash2), 0);
+        // 测试全零
+        let hash_all_zeros = [0u8; 32];
+        assert_eq!(count_leading_zeros_high_difficulty_optimized(&hash_all_zeros), 256);
     }
 
     #[test]
-    fn test_numa_aware_prefix() {
-        let mut prefix = NumaAwareChallengePrefix::new("test:1");
-        let msg = prefix.create_message(12345);
-        assert_eq!(std::str::from_utf8(msg).unwrap(), "test:112345");
+    fn test_adaptive_batch_sizing() {
+        let stats = HighDifficultyStats::new();
+        
+        // 测试不同难度下的批处理大小
+        assert_eq!(stats.calculate_adaptive_batch_size(), ULTRA_BATCH_SIZE); // 初始状态
+        
+        stats.update_best(8);
+        assert_eq!(stats.calculate_adaptive_batch_size(), ULTRA_BATCH_SIZE * 2); // 8个零：2倍大小
+        
+        stats.update_best(12);
+        assert_eq!(stats.calculate_adaptive_batch_size(), ULTRA_BATCH_SIZE * 4); // 12个零：4倍大小
+        
+        stats.update_best(18);
+        assert_eq!(stats.calculate_adaptive_batch_size(), ULTRA_BATCH_SIZE * 8); // 18个零：8倍大小
+    }
+
+    #[test]
+    fn test_high_difficulty_prefix() {
+        let mut prefix = HighDifficultyPrefix::new("test:1");
+        let start_nonce = 100000u64;
+        let batch_size = 3;
+        let mut messages = vec![[0u8; MAX_CHALLENGE_LEN + 32]; batch_size];
+        let mut message_lengths = vec![0usize; batch_size];
+        
+        prefix.create_message_mega_batch(start_nonce, batch_size, &mut messages, &mut message_lengths);
+        
+        // 验证第一个消息
+        let msg1_str = std::str::from_utf8(&messages[0][..message_lengths[0]]).unwrap();
+        assert_eq!(msg1_str, "test:1100000");
+        
+        // 验证第二个消息
+        let msg2_str = std::str::from_utf8(&messages[1][..message_lengths[1]]).unwrap();
+        assert_eq!(msg2_str, "test:1100001");
+    }
+
+    #[test]
+    fn test_high_difficulty_processor() {
+        let mut processor = HighDifficultySha256Processor::new(2);
+        let messages = [
+            {
+                let mut msg = [0u8; MAX_CHALLENGE_LEN + 32];
+                msg[..5].copy_from_slice(b"hello");
+                msg
+            },
+            {
+                let mut msg = [0u8; MAX_CHALLENGE_LEN + 32];
+                msg[..5].copy_from_slice(b"world");
+                msg
+            }
+        ];
+        let lengths = [5, 5];
+        let mut results = [[0u8; 32]; 2];
+        
+        // 测试批量处理（使用低阈值确保不会早退）
+        let result = processor.batch_process_high_difficulty(&messages, &lengths, &mut results, 0, 1);
+        
+        // 验证结果不为零（实际哈希值）
+        assert_ne!(results[0], [0u8; 32]);
+        assert_ne!(results[1], [0u8; 32]);
+        // 验证不同输入产生不同哈希
+        assert_ne!(results[0], results[1]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_simd_high_difficulty() {
+        let test_hashes = [
+            [0u8; 32], // 全零
+            {
+                let mut h = [0u8; 32];
+                h[0] = 0x0f;
+                h
+            }, // 4个前导零
+            {
+                let mut h = [0u8; 32];
+                h[1] = 0x03; // 第一字节为0，第二字节的前6位为0，总共14位
+                h
+            }
+        ];
+
+        for hash in &test_hashes {
+            let scalar_result = count_leading_zeros_high_difficulty_optimized(hash);
+            let simd_result = count_leading_zeros_high_diff_simd(hash);
+            assert_eq!(scalar_result, simd_result, 
+                "SIMD和标量结果不匹配，hash: {:?}, scalar: {}, simd: {}", 
+                hash, scalar_result, simd_result);
+        }
+    }
+
+    #[test]
+    fn test_early_exit_mechanism() {
+        let stats = HighDifficultyStats::new();
+        
+        // 初始状态：早退未启用
+        assert!(!stats.early_exit_enabled.load(Ordering::Acquire));
+        
+        // 低难度：早退仍未启用
+        stats.update_best(8);
+        assert!(!stats.early_exit_enabled.load(Ordering::Acquire));
+        
+        // 高难度：启用早退
+        stats.update_best(12);
+        assert!(stats.early_exit_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_statistics_tracking() {
+        let stats = HighDifficultyStats::new();
+        
+        // 添加一些哈希计算
+        stats.add_hashes(1000, false); // 普通难度
+        stats.add_hashes(500, true);   // 高难度
+        
+        assert_eq!(stats.total_hashes.load(Ordering::Relaxed), 1500);
+        assert_eq!(stats.high_difficulty_hashes.load(Ordering::Relaxed), 500);
+        
+        let ratio = stats.get_high_difficulty_ratio();
+        assert!((ratio - 1.0/3.0).abs() < 0.001); // 500/1500 ≈ 0.333
     }
 }
+
+// 更新的 Cargo.toml 配置 - 专为高难度优化:
+/*
+[package]
+name = "high_difficulty_miner"
+version = "2.0.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+rayon = "1.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+itoa = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+
+# 专为高难度挖矿优化的编译选项
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=znver2",
+    "-C", "target-feature=+avx2,+bmi1,+bmi2,+fma,+popcnt",
+    "-C", "llvm-args=-enable-machine-outliner=never",
+    "-C", "llvm-args=-disable-tail-calls=false"
+]
+
+# 高性能链接选项
+[target.x86_64-unknown-linux-gnu.linker]
+rustflags = ["-C", "link-arg=-Wl,--as-needed"]
+*/
